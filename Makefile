@@ -14,3 +14,7 @@ push: container
 container:
 	docker pull $(IMAGE):$(PATCH)
 	docker tag $(IMAGE):$(PATCH) $(IMAGE):$(TAG)
+
+.PHONY: version
+version:
+	@echo ::set-output name=version::$(TAG)
