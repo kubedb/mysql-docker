@@ -3,7 +3,7 @@ SHELL=/bin/bash -o pipefail
 REGISTRY ?= kubedb
 BIN      := mysql
 IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := 5.7.25
+TAG      := 8.0.14
 
 .PHONY: push
 push: container
@@ -11,8 +11,5 @@ push: container
 
 .PHONY: container
 container:
-	wget -qO peer-finder https://github.com/kmodules/peer-finder/releases/download/v1.0.1-ac/peer-finder
-	chmod +x peer-finder
-	chmod +x on-start.sh
-	docker build --pull -t $(IMAGE):$(TAG) .
-	rm peer-finder
+	docker pull $(BIN):$(TAG)
+	docker tag $(BIN):$(TAG) $(IMAGE):$(TAG)
