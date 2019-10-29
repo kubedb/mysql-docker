@@ -3,7 +3,7 @@ SHELL=/bin/bash -o pipefail
 REGISTRY ?= kubedb
 BIN      := mysql
 IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := 8.0.14
+TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
 
 .PHONY: push
 push: container
@@ -11,5 +11,4 @@ push: container
 
 .PHONY: container
 container:
-	docker pull $(BIN):$(TAG)
-	docker tag $(BIN):$(TAG) $(IMAGE):$(TAG)
+	docker pull $(IMAGE):$(TAG)
