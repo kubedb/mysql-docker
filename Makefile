@@ -16,3 +16,7 @@ container:
 	chmod +x on-start.sh
 	docker build --pull -t $(IMAGE):$(TAG) .
 	rm peer-finder
+
+.PHONY: version
+version:
+	@echo ::set-output name=version::$(TAG)
