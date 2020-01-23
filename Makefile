@@ -11,7 +11,7 @@ push: container
 
 .PHONY: container
 container:
-	docker pull $(IMAGE):$(TAG)
+	docker build --pull -t $(IMAGE):$(TAG) .
 
 .PHONY: version
 version:
