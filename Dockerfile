@@ -3,6 +3,8 @@ FROM mysql:5.7.25
 COPY on-start.sh /
 COPY peer-finder /usr/local/bin/
 
+VOLUME /etc/mysql
+
 # For standalone mysql
 # default entrypoint of parent mysql:5.7.25
 # ENTRYPOINT ["docker-entrypoint.sh"]

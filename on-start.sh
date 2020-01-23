@@ -73,14 +73,15 @@ export cur_addr="${cur_host}:33060"
 myips=$(hostname -I)
 first=${myips%% *}
 # Now use this IP with CIDR notation
-export whitelist="${first}/16"
-
+export whitelist="${first}/8"
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
-cat >>/etc/mysql/my.cnf <<EOL
+mkdir -p /etc/mysql/group-replication.conf.d/
+echo "!includedir /etc/mysql/group-replication.conf.d/" >> /etc/mysql/my.cnf
 
+cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 
 # General replication settings
