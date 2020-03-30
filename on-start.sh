@@ -57,13 +57,13 @@ log "INFO" "Trying to start group with peers'${peers[*]}'"
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
-export seeds=$(echo -n ${hosts} | sed -e "s/,/:33060,/g" && echo -n ":33060")
+export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
 # server-id calculated as $BASE_SERVER_ID + pod index
 declare -i srv_id=$(hostname | sed -e "s/${BASE_NAME}-//g")
 ((srv_id += $BASE_SERVER_ID))
 
-export cur_addr="${cur_host}:33060"
+export cur_addr="${cur_host}:33061"
 
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
@@ -73,14 +73,15 @@ export cur_addr="${cur_host}:33060"
 myips=$(hostname -I)
 first=${myips%% *}
 # Now use this IP with CIDR notation
-export whitelist="${first}/16"
-
+export whitelist="${first}/8"
 # the mysqld configurations have take by following
 # 01. official doc: https://dev.mysql.com/doc/refman/5.7/en/group-replication-configuring-instances.html
 # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
 log "INFO" "Storing default mysqld config into /etc/mysql/my.cnf"
-cat >>/etc/mysql/my.cnf <<EOL
+mkdir -p /etc/mysql/group-replication.conf.d/
+echo "!includedir /etc/mysql/group-replication.conf.d/" >> /etc/mysql/my.cnf
 
+cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 
 # General replication settings
@@ -118,9 +119,6 @@ EOL
 
 log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
 
-# ensure the mysqld process be stopped
-/etc/init.d/mysql stop
-
 # run the mysqld process in background with user provided arguments if any
 docker-entrypoint.sh mysqld $@ &
 pid=$!
@@ -129,8 +127,8 @@ log "INFO" "The process id of mysqld is '$pid'"
 # wait for all mysql servers be running (alive)
 for host in ${peers[*]}; do
   for i in {900..0}; do
-    out=$(mysqladmin -u ${USER} --password=${PASSWORD} --host=${host} ping 2>/dev/null)
-    if [[ "$out" == "mysqld is alive" ]]; then
+    out=$(mysql -u ${USER} --password=${PASSWORD} --host=${host} -N -e "select 1;" 2>/dev/null)
+    if [[ "$out" == "1" ]]; then
       break
     fi
 
