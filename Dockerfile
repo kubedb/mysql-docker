@@ -1,7 +1,7 @@
 FROM mysql:5.7.25
 
 COPY on-start.sh /
-COPY peer-finder /usr/local/bin/
+COPY peer-finder /usr/local/bin/peer-finder
 
 VOLUME /etc/mysql
 

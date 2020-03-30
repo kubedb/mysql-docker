@@ -57,13 +57,13 @@ log "INFO" "Trying to start group with peers'${peers[*]}'"
 export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
-export seeds=$(echo -n ${hosts} | sed -e "s/,/:33060,/g" && echo -n ":33060")
+export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
 # server-id calculated as $BASE_SERVER_ID + pod index
 declare -i srv_id=$(hostname | sed -e "s/${BASE_NAME}-//g")
 ((srv_id += $BASE_SERVER_ID))
 
-export cur_addr="${cur_host}:33060"
+export cur_addr="${cur_host}:33061"
 
 # Get ip_whitelist
 # https://dev.mysql.com/doc/refman/5.7/en/group-replication-options.html#sysvar_group_replication_ip_whitelist
@@ -130,8 +130,8 @@ log "INFO" "The process id of mysqld is '$pid'"
 # wait for all mysql servers be running (alive)
 for host in ${peers[*]}; do
   for i in {900..0}; do
-    out=$(mysqladmin -u ${USER} --password=${PASSWORD} --host=${host} ping 2>/dev/null)
-    if [[ "$out" == "mysqld is alive" ]]; then
+    out=$(mysql -u ${USER} --password=${PASSWORD} --host=${host} -N -e "select 1;" 2>/dev/null)
+    if [[ "$out" == "1" ]]; then
       break
     fi
 
