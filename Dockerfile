@@ -1,4 +1,4 @@
-FROM mysql:8.0.14
+FROM mysql:8.0.18
 
 COPY on-start.sh /
 COPY peer-finder /usr/local/bin/peer-finder
