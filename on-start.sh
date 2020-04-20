@@ -205,23 +205,29 @@ done
 function find_group() {
   # TODO: Need to handle for multiple group existence
   group_found=0
-  for host in $@; do
+  for i in {60..0}; do
+    for host in $@; do
 
-    export mysql="$mysql_header --host=${host}"
-    # value may be 'UNDEFINED'
-    primary_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-    if [[ -n "$primary_id" ]]; then
-      ids=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE' OR MEMBER_STATE = 'RECOVERING';"))
+      export mysql="$mysql_header --host=${host}"
+      # value may be 'UNDEFINED'
+        primary_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
+      if [[ -n "$primary_id" ]]; then
+        ids=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
 
-      for id in ${ids[@]}; do
-        if [[ "${primary_id}" == "${id}" ]]; then
-          group_found=1
-          primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_id}';" | awk '{print $1}')
+        for id in ${ids[@]}; do
+          if [[ "${primary_id}" == "${id}" ]]; then
+            group_found=1
+            primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_id}';" | awk '{print $1}')
+            break
+          fi
+        done
+      fi
 
-          break
-        fi
-      done
-    fi
+      if [[ "$group_found" == "1" ]]; then
+        break
+      fi
+
+    done
 
     if [[ "$group_found" == "1" ]]; then
       break
