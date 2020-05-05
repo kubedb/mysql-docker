@@ -120,7 +120,7 @@ EOL
 log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
 
 # ensure the mysqld process be stopped
-mysqladmin -u ${USER} --password=${PASSWORD} shutdown
+mysqladmin -u ${USER} --password=${PASSWORD} shutdown 2>/dev/null
 
 # run the mysqld process in background with user provided arguments if any
 docker-entrypoint.sh mysqld $@ &
