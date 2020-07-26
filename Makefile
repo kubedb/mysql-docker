@@ -11,8 +11,25 @@ push: container
 
 .PHONY: container
 container:
+	wget -qO peer-finder https://github.com/kmodules/peer-finder/releases/download/v1.0.1-ac/peer-finder
+	chmod +x peer-finder
+	chmod +x on-start.sh
 	docker build --pull -t $(IMAGE):$(TAG) .
+	rm peer-finder
 
 .PHONY: version
 version:
 	@echo ::set-output name=version::$(TAG)
+
+.PHONY: fmt
+fmt:
+	@find . -path ./vendor -prune -o -name '*.sh' -exec shfmt -l -w -ci -i 4 {} \;
+
+.PHONY: verify
+verify: fmt
+	@if !(git diff --exit-code HEAD); then \
+		echo "files are out of date, run make fmt"; exit 1; \
+	fi
+
+.PHONY: ci
+ci: verify
