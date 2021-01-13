@@ -131,6 +131,7 @@ log "INFO" "The process id of mysqld is '$pid'"
 for host in ${peers[*]}; do
     for i in {900..0}; do
         out=$(mysql -u ${USER} --password=${PASSWORD} --host=${host} -N -e "select 1;" 2>/dev/null)
+        log "INFO" ".................................ping=$out.........................."
         if [[ "$out" == "1" ]]; then
             break
         fi
@@ -159,7 +160,9 @@ export mysql_header="mysql -u ${USER}"
 
 # this is to bypass the warning message for using password
 export MYSQL_PWD=${PASSWORD}
-export member_hosts=($(echo -n ${hosts} | sed -e "s/,/ /g"))
+export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
+
+log "INFO" "..................member_hosts=$member_hosts....................................."
 
 for host in ${member_hosts[*]}; do
     log "INFO" "Initializing the server (${host})..."
@@ -202,46 +205,62 @@ done
 # End initialization process                                        #
 #####################################################################
 
-function find_group() {
-    # TODO: Need to handle for multiple group existence
-    group_found=0
-    for i in {60..0}; do
-        for host in $@; do
+function check_existing_cluster() {
+    is_primary_exists=0
 
-            export mysql="$mysql_header --host=${host}"
-            # value may be 'UNDEFINED'
-            primary_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-            if [[ -n "$primary_id" ]]; then
-                ids=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
+    for host in $@; do
+      if [[ "$cur_host" == "$host" ]]; then
+          continue
+      fi
 
-                for id in ${ids[@]}; do
-                    if [[ "${primary_id}" == "${id}" ]]; then
-                        group_found=1
-                        primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_id}';" | awk '{print $1}')
-                        break
-                    fi
-                done
-            fi
+      export mysql="$mysql_header --host=${host}"
 
-            if [[ "$group_found" == "1" ]]; then
+      log "INFO" ".....................query for host=${mysql}.............................."
+
+       members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
+
+       log "INFO" "..........................members_id=$members_id............................................."
+
+       for member_id in ${members_id[*]}; do
+          log "INFO" "..........................member_id=$member_id............................................."
+          for i in {30..0}; do
+             primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
+             log "INFO" "..........................primary_member_id=$primary_member_id............................................."
+             if [[ "$member_id" == "$primary_member_id" ]]; then
+                is_primary_exists=1
+                primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
+                log "INFO" "...................primary exist=$is_primary_exists and primary_host='${primary_host}'................................"
                 break
-            fi
+             fi
 
-        done
+             echo -n .
+             sleep 1
+          done
 
-        if [[ "$group_found" == "1" ]]; then
-            break
+          if [[ "$is_primary_exists" == "1" ]]; then
+             break
+          fi
+
+       done
+
+        if [[ "$is_primary_exists" == "1" ]]; then
+           break
         fi
 
     done
-
-    echo -n "${group_found}"
 }
+
+
 
 log "INFO" "Checking whether there exists any replication group or not..."
 export primary_host=$(get_host_name 0)
-find_group ${member_hosts[*]}
-export found=$(find_group ${member_hosts[*]})
+check_existing_cluster "${member_hosts[*]}"
+
+
+
+log "INFO" "................................found=$is_primary_exists and primary host=$primary_host............................"
+
+
 
 # filter the Pod index from the variable $primary_host
 #primary_idx=$(echo ${primary_host} | sed -e "s/.${GOV_SVC}.${NAMESPACE}.svc.cluster.local//g" | sed -e "s/${BASE_NAME}-//g")
@@ -252,7 +271,7 @@ primary_idx=$(echo ${primary_host} | sed -e "s/.${GOV_SVC}.${NAMESPACE}//g" | se
 # Begin group replication bootstrap process if no group exists      #
 #####################################################################
 
-if [[ "$found" == "0" ]]; then
+if [[ "$is_primary_exists" == "0" ]]; then
     mysql="$mysql_header --host=$primary_host"
 
     # get the member state from performance_schema.replication_group_members
@@ -300,9 +319,10 @@ for host in ${member_hosts[*]}; do
         out=$(${mysql} -N -e "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST = '$host';")
 
         if [[ -z "$out" || "$out" == "OFFLINE" ]]; then
-            log "INFO" "Starting group replication on (${host})..."
 
             ${mysql} -N -e "STOP GROUP_REPLICATION;"
+
+            log "INFO" "....................finished stop replication................."
 
             # reset is needed for the first time creation
             if [[ "${is_new[$host_idx]}" -eq "1" ]]; then
@@ -310,6 +330,7 @@ for host in ${member_hosts[*]}; do
                 ${mysql} -N -e "RESET MASTER;"
             fi
 
+            log "INFO" "Starting group replication on (${host})..."
             ${mysql} -N -e "START GROUP_REPLICATION;"
 
             log "INFO" "$host is joined the group $GROUP_NAME"
