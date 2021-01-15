@@ -1,9 +1,10 @@
 SHELL=/bin/bash -o pipefail
 
-REGISTRY ?= kubedb
+REGISTRY ?= suaas21
 BIN      := mysql
 IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
+TAG      := 8.0.21
+#TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
 
 .PHONY: push
 push: container
