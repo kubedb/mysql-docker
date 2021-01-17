@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -x
+
 #set -eoux pipefail
 
 # Environment variables passed from Pod env are as follows:
@@ -125,9 +127,42 @@ EOL
 
 # run the mysqld process in background with user provided arguments if any
 log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
+set -- "$@" '--log_error_verbosity=3'
 docker-entrypoint.sh mysqld $@ &
+
+until [ -f /var/run/mysqld/mysqld.pid ]
+do
+     sleep 2
+done
+cat /var/run/mysqld/mysqld.pid
+
+pstree
+
+strace -s2048 -f -p $(cat /var/run/mysqld/mysqld.pid)
+
+
 pid=$!
 log "INFO" "The process id of mysqld is '$pid'"
+
+function retry {
+    local retries="$1"
+    shift
+
+    local count=0
+    local wait=1
+    until "$@" ; do
+        exit="$?"
+        count=$(($count + 1))
+        if [ $count -lt $retries ]; then
+            echo "Retry $count/$retries exited $exit, retrying in $wait seconds..."
+            sleep $wait
+        else
+            echo "Retry $count/$retries exited $exit, no more retries left."
+            return $exit
+        fi
+    done
+    return 0
+}
 
 function wait_for_mysqld_running() {
     # wait for mysql daemon be running (alive)
@@ -158,16 +193,9 @@ function create_replication_user() {
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
     # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not for host: ${cur_host}..."
-    local mysql="$mysql_header --host=$cur_host"
+    local mysql="$mysql_header"
 
-    for i in {900..0}; do
-        out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
-        if [[ "$?" == 0 ]]; then # retry until succeed
-            break
-        fi
-        sleep 1
-    done
-
+    out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found and creating one..."
@@ -187,13 +215,13 @@ function create_replication_user() {
 function install_group_replication_plugin() {
     # ensure the group replication plugin be installed
     log "INFO" "Checking whether group replication plugin is installed or not..."
-    local mysql="$mysql_header --host=$cur_host"
+    local mysql="$mysql_header"
 
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin..."
-        # replication plugin will be install when the member get bootstrap face or join first
-        # that's why assign `joining_for_first_time` variable to 1
+        # replication plugin will be install when the member get bootstrap face or join the group first
+        # that's why assign `joining_for_first_time` variable to 1 for taking further reset process
         joining_for_first_time=1
         ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
@@ -227,17 +255,17 @@ function check_member_list_updated() {
         if [[ "$cur_host" == "$host" ]]; then
             continue
         fi
-        for i in {30..0}; do
-            alive_members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
-            members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;")
-
+        for i in {60..0}; do
+            alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
             alive_cluster_length=${#alive_members_id[@]}
-            cluster_length=${#members_id[@]}
+            listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
+            cluster_length=${#listed_members_id[@]}
 
-            log "INFO" "Checking mysql cluster is fully updated for host: $host"
-            if [[ "$cluster_length" == "$alive_cluster_length" ]]; then
+            log "INFO" "Checking mysql cluster from $host, online-----> $alive_cluster_length total listed member-----> $cluster_length"
+            if [[ "$alive_cluster_length" -eq "$cluster_length" ]]; then
                 break
             fi
+            sleep 1
         done
     done
 }
@@ -283,33 +311,15 @@ function wait_for_primary() {
 }
 
 function bootstrap_cluster() {
-    # First start group replication inside the primary
-    # filter the Pod index from the variable $primary_host
-    #    local mysql="$mysql_header --host=$primary_host"
-    local mysql="$mysql_header --host=$cur_host"
+    # for bootstrap group replication, the following steps have been taken:
+    # - initially reset the member to cleanup all data configuration/ set the binlog and gtid's initial position.
+    #   https://dev.mysql.com/doc/refman/8.0/en/reset-master.html
+    # - set global variable group_replication_bootstrap_group `ON`
+    # - start group replication
+    # - set global variable group_replication_bootstrap_group `OFF`
+    # https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
+    local mysql="$mysql_header"
 
-    #    # get the member state from performance_schema.replication_group_members
-    #    out=$(${mysql} -N -e "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST = '$primary_host';")
-    #    if [[ -z "$out" || "$out" == "OFFLINE" ]]; then
-    #        log "INFO" "No group is found and bootstrapping one on host '$primary_host'..."
-    #
-    #        log "INFO" "Run 'STOP GROUP_REPLICATION' to stop replication if running"
-    #        ${mysql} -N -e "STOP GROUP_REPLICATION;"
-    #
-    #        # reset is needed for the first time creation
-    #        log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $primary_host..."
-    #        ${mysql} -N -e "RESET MASTER;"
-    #
-    #        ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    #        ${mysql} -N -e "START GROUP_REPLICATION;"
-    #        ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
-    #
-    #        log "INFO" "A new group (name $GROUP_NAME) is bootstrapped on $primary_host"
-    #
-    #    else
-    #        log "INFO" "The member is 'UNREACHABLE' state, trying to get online. So no need to bootstrap, member state: '$out' on host '$primary_host'..."
-    #    fi
-    # reset is needed for the first time creation
     log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $cur_host..."
     ${mysql} -N -e "RESET MASTER;"
     ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
@@ -318,44 +328,19 @@ function bootstrap_cluster() {
 }
 
 function join_into_cluster() {
-    #    # Now start group replication inside the others
-    #    log "INFO" "The replica is joining into the existing group..."
-    #    # host_idx=$(echo ${primary_host} | sed -e "s/.${GOV_SVC}.${NAMESPACE}//g" | sed -e "s/${BASE_NAME}-//g")
-    #    local host_idx=$(echo ${cur_host} | sed -e "s/.${GOV_SVC}.${NAMESPACE}//g" | sed -e "s/${BASE_NAME}-//g")
-    local mysql="$mysql_header --host=$cur_host"
-    #
-    #    # get the member state from performance_schema.replication_group_members
-    #    out=$(${mysql} -N -e "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_HOST = '$cur_host';")
-    #
-    #    if [[ -z "$out" || "$out" == "OFFLINE" ]]; then
-    #        log "INFO" "Run 'STOP GROUP_REPLICATION' to stop replication if running"
-    #        ${mysql} -N -e "STOP GROUP_REPLICATION;"
-    #
-    #        log "INFO" "run 'RESET MASTER' in primary in firs time creation for host $cur_host..."
-    #        ${mysql} -N -e "RESET MASTER;"
-    #
-    #        #        if [[ "$joining_for_first_time" == "1" ]]; then
-    #        #            log "INFO" "run 'RESET MASTER' in primary in firs time creation for host $cur_host..."
-    #        #            ${mysql} -N -e "RESET MASTER;"
-    #        #        fi
-    #
-    #        log "INFO" "Starting group replication on (${cur_host})..."
-    #        ${mysql} -N -e "START GROUP_REPLICATION;"
-    #
-    #        log "INFO" "$cur_host is joined the group $GROUP_NAME"
-    #
-    #    else
-    #        log "INFO" "The Member is alive, No need to start replication, member state: '${out}' host: '${cur_host}'..."
-    #    fi
+    # Now start group replication to join into the existing group
+    log "INFO" "The replica, ${cur_host} is joining into the existing group..."
+    local mysql="$mysql_header"
+
+    # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         ${mysql} -N -e "RESET MASTER;"
     fi
-    log "INFO" "Ensuring previous group replication stopped....."
-    ${mysql} -N -e "STOP GROUP_REPLICATION;"
 
-    log "INFO" "Starting group replication on (${cur_host})..."
-    ${mysql} -N -e "START GROUP_REPLICATION;"
+     # run `START GROUP_REPLICATION` until the the member successfully join into the group
+    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+    log "INFO" "Group replication on (${cur_host}) has been taken place..."
 }
 
 # create mysql client with user exported in mysql_header and export password
@@ -364,7 +349,6 @@ export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
 export joining_for_first_time=0
-
 log "INFO" "Existing member in the group are: $member_hosts"
 
 # wait for mysqld is getting ready for listen and serve
@@ -384,8 +368,8 @@ check_existing_cluster "${member_hosts[*]}"
 export primary_host=$(get_host_name 0)
 
 if [[ "$cluster_exists" == "1" ]]; then
-    #    check_member_list_updated "${member_hosts[*]}"
-    #    wait_for_primary "${member_hosts[*]}"
+    wait_for_primary "${member_hosts[*]}"
+    check_member_list_updated "${member_hosts[*]}"
     join_into_cluster
 else
     bootstrap_cluster

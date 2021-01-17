@@ -12,7 +12,7 @@ push: container
 
 .PHONY: container
 container:
-	#wget -qO peer-finder https://github.com/kmodules/peer-finder/releases/download/v1.0.1-ac/peer-finder
+	wget -qO peer-finder https://github.com/kmodules/peer-finder/releases/download/v1.0.1-ac/peer-finder
 	chmod +x peer-finder
 	chmod +x on-start.sh
 	docker build --pull -t $(IMAGE):$(TAG) .
@@ -34,3 +34,10 @@ verify: fmt
 
 .PHONY: ci
 ci: verify
+
+# make and load docker image to kind cluster
+.PHONY: push-to-kind
+push-to-kind: container
+	@echo "Loading docker image into kind cluster...."
+	@kind load docker-image $(IMAGE):$(TAG)
+	@echo "Image has been pushed successfully into kind cluster."
