@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-set -x
-
 #set -eoux pipefail
 
 # Environment variables passed from Pod env are as follows:
@@ -121,29 +119,14 @@ report_host = "${cur_host}"
 loose-group_replication_local_address = "${cur_addr}"
 EOL
 
-# ensure the mysqld process be stopped
-#log "INFO" "Shutting down mysql daemon if running..."
-#mysqladmin -u ${USER} --password=${PASSWORD} shutdown 2>/dev/null
-
 # run the mysqld process in background with user provided arguments if any
 log "INFO" "Starting mysql server with 'docker-entrypoint.sh mysqld $@'..."
-set -- "$@" '--log_error_verbosity=3'
 docker-entrypoint.sh mysqld $@ &
-
-until [ -f /var/run/mysqld/mysqld.pid ]
-do
-     sleep 2
-done
-cat /var/run/mysqld/mysqld.pid
-
-pstree
-
-strace -s2048 -f -p $(cat /var/run/mysqld/mysqld.pid)
-
 
 pid=$!
 log "INFO" "The process id of mysqld is '$pid'"
 
+# retry a command up to a specific number of times until it exits successfully,
 function retry {
     local retries="$1"
     shift
@@ -166,7 +149,7 @@ function retry {
 
 function wait_for_mysqld_running() {
     # wait for mysql daemon be running (alive)
-    local mysql="$mysql_header --host=$cur_host"
+    local mysql="$mysql_header --host=127.0.0.1"
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
@@ -193,8 +176,10 @@ function create_replication_user() {
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
     # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not for host: ${cur_host}..."
-    local mysql="$mysql_header"
+    local mysql="$mysql_header --host=127.0.0.1"
 
+    # 1st try to find the the group `repl` user without error, then extract the out whether replication user exist or not
+    retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
@@ -215,8 +200,10 @@ function create_replication_user() {
 function install_group_replication_plugin() {
     # ensure the group replication plugin be installed
     log "INFO" "Checking whether group replication plugin is installed or not..."
-    local mysql="$mysql_header"
+    local mysql="$mysql_header --host=127.0.0.1"
 
+     # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin..."
@@ -240,9 +227,9 @@ function check_existing_cluster() {
         local mysql="$mysql_header --host=${host}"
 
         members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
-        cluster_length=${#members_id[@]}
-        log "INFO" "The length of existing alive cluster is $cluster_length"
-        if [[ "$cluster_length" -ge "1" ]]; then
+        cluster_size=${#members_id[@]}
+        log "INFO" "The size of existing cluster is $cluster_size"
+        if [[ "$cluster_size" -ge "1" ]]; then
             cluster_exists=1
             break
         fi
@@ -257,12 +244,12 @@ function check_member_list_updated() {
         fi
         for i in {60..0}; do
             alive_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
-            alive_cluster_length=${#alive_members_id[@]}
+            alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
-            cluster_length=${#listed_members_id[@]}
+            cluster_size=${#listed_members_id[@]}
 
-            log "INFO" "Checking mysql cluster from $host, online-----> $alive_cluster_length total listed member-----> $cluster_length"
-            if [[ "$alive_cluster_length" -eq "$cluster_length" ]]; then
+            log "INFO" "Checking mysql cluster is updated for host: $host, online===> $alive_cluster_size total listed member===> $cluster_size, step===> $i"
+            if [[ "$alive_cluster_size" -eq "$cluster_size" ]]; then
                 break
             fi
             sleep 1
@@ -279,18 +266,18 @@ function wait_for_primary() {
         local mysql="$mysql_header --host=${host}"
 
         members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
-        cluster_length=${#members_id[@]}
-        log "INFO" "The length of existing alive cluster is $cluster_length"
+        cluster_size=${#members_id[@]}
+        log "INFO" "The size of existing alive cluster is $cluster_size"
 
         local is_primary_found=0
         for member_id in ${members_id[*]}; do
-            for i in {30..0}; do
+            for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
                 log "INFO" "Trying to match updated primary member id with others replica, got primary=$primary_member_id and replica=$member_id, step=====>$i"
                 if [[ "$member_id" == "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
-                    log "INFO" "In existing group replication, found primary: ($primary_host)"
+                    log "INFO" "In existing group replication, found primary: $primary_host"
                     break
                 fi
 
@@ -312,14 +299,13 @@ function wait_for_primary() {
 
 function bootstrap_cluster() {
     # for bootstrap group replication, the following steps have been taken:
-    # - initially reset the member to cleanup all data configuration/ set the binlog and gtid's initial position.
-    #   https://dev.mysql.com/doc/refman/8.0/en/reset-master.html
-    # - set global variable group_replication_bootstrap_group `ON`
+    # - initially reset the member to cleanup all data configuration/set the binlog and gtid's initial position.
+    #   ref: https://dev.mysql.com/doc/refman/8.0/en/reset-master.html
+    # - set global variable group_replication_bootstrap_group to `ON`
     # - start group replication
-    # - set global variable group_replication_bootstrap_group `OFF`
-    # https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
-    local mysql="$mysql_header"
-
+    # - set global variable group_replication_bootstrap_group to `OFF`
+    #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
+    local mysql="$mysql_header --host=127.0.0.1"
     log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $cur_host..."
     ${mysql} -N -e "RESET MASTER;"
     ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
@@ -328,9 +314,9 @@ function bootstrap_cluster() {
 }
 
 function join_into_cluster() {
-    # Now start group replication to join into the existing group
+    # member try to join into the existing group
     log "INFO" "The replica, ${cur_host} is joining into the existing group..."
-    local mysql="$mysql_header"
+    local mysql="$mysql_header --host=127.0.0.1"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     if [[ "$joining_for_first_time" == "1" ]]; then
@@ -376,5 +362,5 @@ else
 fi
 
 # wait for mysqld process running in background
-log "INFO" "Waiting for mysqld server process running..."
+log "INFO" "Waiting for mysqld process running in foreground..."
 wait $pid
