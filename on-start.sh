@@ -184,14 +184,14 @@ function create_replication_user() {
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
         log "INFO" "Replication user not found and creating one..."
-        ${mysql} -N -e "SET SQL_LOG_BIN=0;"
-        ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
-        ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO rpl_user@'%';"
-        ${mysql} -N -e "FLUSH PRIVILEGES;"
-        ${mysql} -N -e "SET SQL_LOG_BIN=1;"
+        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
+        retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
+        retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+        retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO rpl_user@'%';"
+        retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
+        retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
-        ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
+        retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
     else
         log "INFO" "Replication user info exists"
     fi
@@ -210,7 +210,7 @@ function install_group_replication_plugin() {
         # replication plugin will be install when the member get bootstrap face or join the group first
         # that's why assign `joining_for_first_time` variable to 1 for taking further reset process
         joining_for_first_time=1
-        ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+        retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
@@ -307,10 +307,10 @@ function bootstrap_cluster() {
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=127.0.0.1"
     log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $cur_host..."
-    ${mysql} -N -e "RESET MASTER;"
-    ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    ${mysql} -N -e "START GROUP_REPLICATION;"
-    ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
+    retry 120 ${mysql} -N -e "RESET MASTER;"
+    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
+    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+    retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
 }
 
 function join_into_cluster() {
@@ -321,7 +321,7 @@ function join_into_cluster() {
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
-        ${mysql} -N -e "RESET MASTER;"
+        retry 120 ${mysql} -N -e "RESET MASTER;"
     fi
 
      # run `START GROUP_REPLICATION` until the the member successfully join into the group
