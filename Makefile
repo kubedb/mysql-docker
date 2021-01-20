@@ -1,10 +1,9 @@
 SHELL=/bin/bash -o pipefail
 
-REGISTRY ?= suaas21
+REGISTRY ?= kubedb
 BIN      := mysql
 IMAGE    := $(REGISTRY)/$(BIN)
-TAG      := 8.0.21
-#TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
+TAG      := $(shell git describe --exact-match --abbrev=0 2>/dev/null || echo "")
 
 .PHONY: push
 push: container
@@ -16,7 +15,7 @@ container:
 	chmod +x peer-finder
 	chmod +x on-start.sh
 	docker build --pull -t $(IMAGE):$(TAG) .
-	#rm peer-finder
+	rm peer-finder
 
 .PHONY: version
 version:
