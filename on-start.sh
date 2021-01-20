@@ -328,6 +328,12 @@ function join_into_cluster() {
     log "INFO" "Group replication on (${cur_host}) has been taken place..."
 }
 
+function extra_config() {
+  log "INFO" "extra config for group replication..."
+  local mysql="$mysql_header --host=127.0.0.1"
+  retry 120 ${mysql} -N -e "SET GLOBAL group_replication_message_cache_size=134217728"
+}
+
 # create mysql client with user exported in mysql_header and export password
 # this is to bypass the warning message for using password
 export mysql_header="mysql -u ${USER} --port=3306"
@@ -356,8 +362,10 @@ if [[ "$cluster_exists" == "1" ]]; then
     wait_for_primary "${member_hosts[*]}"
     check_member_list_updated "${member_hosts[*]}"
     join_into_cluster
+    extra_config
 else
     bootstrap_cluster
+    extra_config
 fi
 
 # wait for mysqld process running in background
