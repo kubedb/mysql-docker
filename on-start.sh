@@ -187,7 +187,6 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO rpl_user@'%';"
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
