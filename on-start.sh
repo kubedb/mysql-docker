@@ -133,7 +133,7 @@ function retry {
 
     local count=0
     local wait=1
-    until "$@" ; do
+    until "$@"; do
         exit="$?"
         count=$(($count + 1))
         if [ $count -lt $retries ]; then
@@ -174,7 +174,8 @@ function create_replication_user() {
     # now we need to configure a replication user for each server.
     # the procedures for this have been taken by following
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
-    # 02. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
+    # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
+    # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
     log "INFO" "Checking whether replication user exist or not for host: ${cur_host}..."
     local mysql="$mysql_header --host=127.0.0.1"
 
@@ -187,6 +188,11 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning
+        # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
+        retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
+        retry 120 ${mysql} -N -e "GRANT CLONE_ADMIN ON *.* TO 'repl'@'%';"
         retry 120 ${mysql} -N -e "FLUSH PRIVILEGES;"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=1;"
 
@@ -201,18 +207,35 @@ function install_group_replication_plugin() {
     log "INFO" "Checking whether group replication plugin is installed or not..."
     local mysql="$mysql_header --host=127.0.0.1"
 
-     # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin..."
-        # replication plugin will be install when the member get bootstrap face or join the group first
-        # that's why assign `joining_for_first_time` variable to 1 for taking further reset process
+        # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
+        # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
         retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
     else
         log "INFO" "Already group replication plugin is installed"
+    fi
+}
+
+function install_clone_plugin() {
+    # ensure the group replication plugin be installed
+    log "INFO" "Checking whether clone plugin is installed or not..."
+    local mysql="$mysql_header --host=127.0.0.1"
+
+    # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
+    out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
+    if [[ -z "$out" ]]; then
+        log "INFO" "Clone plugin is not installed. Installing the plugin..."
+        retry 120 ${mysql} -e "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
+        log "INFO" "Clone plugin successfully installed"
+    else
+        log "INFO" "Already clone plugin is installed"
     fi
 }
 
@@ -272,8 +295,8 @@ function wait_for_primary() {
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Trying to match updated primary member id with others replica, got primary=$primary_member_id and replica=$member_id, step=====>$i"
-                if [[ "$member_id" == "$primary_member_id" ]]; then
+                log "INFO" "Trying to find primary member id, step=====>$i"
+                if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
                     log "INFO" "In existing group replication, found primary: $primary_host"
@@ -305,7 +328,7 @@ function bootstrap_cluster() {
     # - set global variable group_replication_bootstrap_group to `OFF`
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=127.0.0.1"
-    log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $cur_host..."
+    log "INFO" "bootstrapping cluster with host $cur_host..."
     retry 120 ${mysql} -N -e "RESET MASTER;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
@@ -318,20 +341,18 @@ function join_into_cluster() {
     local mysql="$mysql_header --host=127.0.0.1"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
+    # then run clone process to copy data directly from primary node. That's why pod will be restart for 1st time joining into the group replication.
+    # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
+        retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='$primary_host:3306';"
+        ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
+    else
+        # run `START GROUP_REPLICATION` until the the member successfully join into the group
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        log "INFO" "Group replication on (${cur_host}) has been taken place..."
     fi
-
-     # run `START GROUP_REPLICATION` until the the member successfully join into the group
-    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
-    log "INFO" "Group replication on (${cur_host}) has been taken place..."
-}
-
-function extra_config() {
-  log "INFO" "extra config for group replication..."
-  local mysql="$mysql_header --host=127.0.0.1"
-  retry 120 ${mysql} -N -e "SET GLOBAL group_replication_message_cache_size=134217728"
 }
 
 # create mysql client with user exported in mysql_header and export password
@@ -351,21 +372,22 @@ create_replication_user
 # ensure replication plugin is installed
 install_group_replication_plugin
 
+# ensure clone plugin is installed
+install_clone_plugin
+
 # checking group replication existence
 check_existing_cluster "${member_hosts[*]}"
 
-# set primary host in replica 0 for 1st time bootstrap
-# it will be override in `wait_for_primary` function when it will get the updated primary host
+# for cluster bootstrapping, by-default replica 0 will be selected for primary_host
+# it will also be overwritten in `wait_for_primary` function when it will get the updated primary_host
 export primary_host=$(get_host_name 0)
 
 if [[ "$cluster_exists" == "1" ]]; then
-    wait_for_primary "${member_hosts[*]}"
     check_member_list_updated "${member_hosts[*]}"
+    wait_for_primary "${member_hosts[*]}"
     join_into_cluster
-    extra_config
 else
     bootstrap_cluster
-    extra_config
 fi
 
 # wait for mysqld process running in background
