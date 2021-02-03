@@ -5,6 +5,7 @@
 # Environment variables passed from Pod env are as follows:
 #
 #   GROUP_NAME          = a uuid treated as the name of the replication group
+#   DB_NAME             = name of the database CR
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
 #   BASE_SERVER_ID      = server-id of the primary member
 #   GOV_SVC             = the name of the governing service
@@ -59,9 +60,14 @@ export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
-# server-id calculated as $BASE_SERVER_ID + pod index
-declare -i srv_id=$(hostname | sed -e "s/${BASE_NAME}-//g")
-((srv_id += $BASE_SERVER_ID))
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 232 − 1.
+# “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
+# https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
+# the server ID is calculated using the below formula:
+# svr_id=statefulset_ordinal * 100 + pod_ordinal
+declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
+declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
+declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
 export cur_addr="${cur_host}:33061"
 
@@ -112,7 +118,7 @@ loose-group_replication_group_seeds = "${seeds}"
 #loose-group_replication_enforce_update_everywhere_checks = ON
 
 # Host specific replication configuration
-server_id = ${srv_id}
+server_id = ${svr_id}
 #bind-address = "${cur_host}"
 bind-address = "0.0.0.0"
 report_host = "${cur_host}"
