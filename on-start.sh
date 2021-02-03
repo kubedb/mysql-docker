@@ -5,6 +5,7 @@
 # Environment variables passed from Pod env are as follows:
 #
 #   GROUP_NAME          = a uuid treated as the name of the replication group
+#   DB_NAME             = name of the database CR
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
 #   BASE_SERVER_ID      = server-id of the primary member
 #   GOV_SVC             = the name of the governing service
@@ -59,9 +60,14 @@ export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
-# server-id calculated as $BASE_SERVER_ID + pod index
-declare -i srv_id=$(hostname | sed -e "s/${BASE_NAME}-//g")
-((srv_id += $BASE_SERVER_ID))
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 232 − 1.
+# “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
+# https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
+# the server ID is calculated using the below formula:
+# svr_id=statefulset_ordinal * 100 + pod_ordinal
+declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
+declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
+declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
 export cur_addr="${cur_host}:33061"
 
@@ -84,8 +90,6 @@ echo "!includedir /etc/mysql/group-replication.conf.d/" >>/etc/mysql/my.cnf
 cat >>/etc/mysql/group-replication.conf.d/group.cnf <<EOL
 [mysqld]
 disabled_storage_engines="MyISAM,BLACKHOLE,FEDERATED,ARCHIVE,MEMORY"
-
-#plugin-load-add=mysql_clone.so
 
 # General replication settings
 gtid_mode = ON
@@ -113,7 +117,7 @@ loose-group_replication_group_seeds = "${seeds}"
 #loose-group_replication_enforce_update_everywhere_checks = ON
 
 # Host specific replication configuration
-server_id = ${srv_id}
+server_id = ${svr_id}
 #bind-address = "${cur_host}"
 bind-address = "0.0.0.0"
 report_host = "${cur_host}"
@@ -208,8 +212,8 @@ function install_group_replication_plugin() {
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
         log "INFO" "Group replication plugin is not installed. Installing the plugin..."
-        # replication plugin will be install when the member get bootstrap face or join the group first
-        # that's why assign `joining_for_first_time` variable to 1 for taking further reset process
+        # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
+        # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
         retry 120 ${mysql} -e "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
         log "INFO" "Group replication plugin successfully installed"
@@ -274,8 +278,8 @@ function wait_for_primary() {
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Trying to match updated primary member id with others replica, got primary=$primary_member_id and replica=$member_id, step=====>$i"
-                if [[ "$member_id" == "$primary_member_id" ]]; then
+                log "INFO" "Trying to find primary member id, step=====>$i"
+                if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
                     log "INFO" "In existing group replication, found primary: $primary_host"
@@ -307,7 +311,7 @@ function bootstrap_cluster() {
     # - set global variable group_replication_bootstrap_group to `OFF`
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=127.0.0.1"
-    log "INFO" "run 'RESET MASTER' for primary at bootstrap time, host $cur_host..."
+    log "INFO" "bootstrapping cluster with host $cur_host..."
     retry 120 ${mysql} -N -e "RESET MASTER;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
@@ -350,13 +354,13 @@ install_group_replication_plugin
 # checking group replication existence
 check_existing_cluster "${member_hosts[*]}"
 
-# set primary host in replica 0 for 1st time bootstrap
-# it will be override in `wait_for_primary` function when it will get the updated primary host
+# for cluster bootstrapping, by-default replica 0 will be selected for primary_host
+# it will also be overwritten in `wait_for_primary` function when it will get the updated primary_host
 export primary_host=$(get_host_name 0)
 
 if [[ "$cluster_exists" == "1" ]]; then
-    wait_for_primary "${member_hosts[*]}"
     check_member_list_updated "${member_hosts[*]}"
+    wait_for_primary "${member_hosts[*]}"
     join_into_cluster
 else
     bootstrap_cluster
