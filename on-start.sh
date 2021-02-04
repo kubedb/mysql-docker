@@ -17,6 +17,7 @@ script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
+DB_VERSION="8.0.23"
 
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -194,7 +195,7 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning
+        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
         # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
         retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
@@ -305,6 +306,7 @@ function wait_for_primary() {
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
+                    primary_version=$(${mysql_header} --host=$primary_host -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
                     log "INFO" "In existing group replication, found primary: $primary_host"
                     break
                 fi
@@ -349,12 +351,19 @@ function join_into_cluster() {
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from primary node. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
+    is_clone_process_run=0
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='$primary_host:3306';"
-        ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
-    else
+        # clone process run when the donor and recipient must have the same MySQL server version
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
+        if [[ $primary_version == *$DB_VERSION* ]]; then
+            ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
+            is_clone_process_run=1
+        fi
+    fi
+    if [[ $is_clone_process_run == 0 ]]; then
         # run `START GROUP_REPLICATION` until the the member successfully join into the group
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Group replication on (${cur_host}) has been taken place..."
