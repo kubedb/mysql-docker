@@ -5,6 +5,7 @@
 # Environment variables passed from Pod env are as follows:
 #
 #   GROUP_NAME          = a uuid treated as the name of the replication group
+#   DB_NAME             = name of the database CR
 #   BASE_NAME           = name of the StatefulSet (same as the name of CRD)
 #   BASE_SERVER_ID      = server-id of the primary member
 #   GOV_SVC             = the name of the governing service
@@ -16,6 +17,7 @@ script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
+DB_VERSION="8.0.21"
 
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -59,9 +61,14 @@ export hosts=$(echo -n ${peers[*]} | sed -e "s/ /,/g")
 # comma separated seed addresses of the hosts (host1:port1,host2:port2,...)
 export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 
-# server-id calculated as $BASE_SERVER_ID + pod index
-declare -i srv_id=$(hostname | sed -e "s/${BASE_NAME}-//g")
-((srv_id += $BASE_SERVER_ID))
+# In a replication topology, we must specify a unique server ID for each replication server, in the range from 1 to 232 − 1.
+# “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
+# https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
+# the server ID is calculated using the below formula:
+# svr_id=statefulset_ordinal * 100 + pod_ordinal
+declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
+declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
+declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
 export cur_addr="${cur_host}:33061"
 
@@ -112,7 +119,7 @@ loose-group_replication_group_seeds = "${seeds}"
 #loose-group_replication_enforce_update_everywhere_checks = ON
 
 # Host specific replication configuration
-server_id = ${srv_id}
+server_id = ${svr_id}
 #bind-address = "${cur_host}"
 bind-address = "0.0.0.0"
 report_host = "${cur_host}"
@@ -188,7 +195,7 @@ function create_replication_user() {
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
-        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning
+        #  You must therefore give the `BACKUP_ADMIN` and `CLONE_ADMIN` privilege to this replication user on all group members that support cloning process
         # https://dev.mysql.com/doc/refman/8.0/en/group-replication-cloning.html
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
         retry 120 ${mysql} -N -e "GRANT BACKUP_ADMIN ON *.* TO 'repl'@'%';"
@@ -299,6 +306,11 @@ function wait_for_primary() {
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
+                    # find database version and size from primary member for applying further clone approach
+                    primary_version=$(${mysql_header} --host=$primary_host -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
+                    # calculate data size of the primary node.
+                    # https://forums.mysql.com/read.php?108,201578,201578
+                    primary_db_size=$(${mysql_header} --host=$primary_host -N -e 'select round(sum( data_length + index_length) / 1024 /  1024) "size in mb" from information_schema.tables;')
                     log "INFO" "In existing group replication, found primary: $primary_host"
                     break
                 fi
@@ -343,13 +355,21 @@ function join_into_cluster() {
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from primary node. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
+    is_clone_process_run=0
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
         retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='$primary_host:3306';"
-        ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
-    else
-        # run `START GROUP_REPLICATION` until the the member successfully join into the group
+        # clone process run when the donor and recipient must have the same MySQL server version and
+        # the database size will be 128mb
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
+        if [[ $primary_version == *$DB_VERSION* ]] && [ $primary_db_size -ge 128 ]; then
+            ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
+            is_clone_process_run=1
+        fi
+    fi
+    if [[ $is_clone_process_run == 0 ]]; then
+        # when clone approach not run then the member will try to join into the group
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
         log "INFO" "Group replication on (${cur_host}) has been taken place..."
     fi
