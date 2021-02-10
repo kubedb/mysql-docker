@@ -17,7 +17,6 @@ script_name=${0##*/}
 NAMESPACE="$POD_NAMESPACE"
 USER="$MYSQL_ROOT_USERNAME"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
-DB_VERSION="8.0.23"
 
 function timestamp() {
     date +"%Y/%m/%d %T"
@@ -65,7 +64,7 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
 # the server ID is calculated using the below formula:
-# svr_id=statefulset_ordinal * 100 + pod_ordinal
+# server_id=statefulset_ordinal * 100 + pod_ordinal + 1
 declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
 declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
 declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
@@ -105,6 +104,9 @@ binlog_format = ROW
 transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
+
+# default tls configuration for the group
+# group_replication_recovery_use_ssl will be overwritten from DB arguments
 loose-group_replication_ssl_mode = REQUIRED
 loose-group_replication_recovery_use_ssl = 1
 
@@ -343,7 +345,7 @@ function bootstrap_cluster() {
     log "INFO" "bootstrapping cluster with host $cur_host..."
     retry 120 ${mysql} -N -e "RESET MASTER;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
-    retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+    retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
 }
 
@@ -363,14 +365,15 @@ function join_into_cluster() {
         # clone process run when the donor and recipient must have the same MySQL server version and
         # the database size will be 128mb
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
-        if [[ $primary_version == *$DB_VERSION* ]] && [ $primary_db_size -ge 128 ]; then
-            ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password';"
+        cur_host_version=$(${mysql_header} -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
+        if [[ "$primary_version" == "$cur_host_version" ]] && [ $primary_db_size -ge 128 ]; then
+            ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password' REQUIRE SSL;"
             is_clone_process_run=1
         fi
     fi
     if [[ $is_clone_process_run == 0 ]]; then
         # when clone approach not run then the member will try to join into the group
-        retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
+        retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Group replication on (${cur_host}) has been taken place..."
     fi
 }
