@@ -103,6 +103,9 @@ binlog_format = ROW
 transaction_write_set_extraction = XXHASH64
 loose-group_replication_bootstrap_group = OFF
 loose-group_replication_start_on_boot = OFF
+
+# default tls configuration for the group
+# group_replication_recovery_use_ssl will be overwritten from DB arguments
 loose-group_replication_ssl_mode = REQUIRED
 loose-group_replication_recovery_use_ssl = 1
 
