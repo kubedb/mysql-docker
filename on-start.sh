@@ -28,13 +28,6 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
-# get_host_name() expects only one argument and that is the index of the Pod of StatefulSet.
-# And it forms the FQDN (Fully Qualified Domain Name) of the $1'th Pod of StatefulSet.
-function get_host_name() {
-    #  echo -n "$BASE_NAME-$1.$GOV_SVC.$NAMESPACE.svc.cluster.local"
-    echo -n "$BASE_NAME-$1.$GOV_SVC.$NAMESPACE"
-}
-
 # get the host names from stdin sent by peer-finder program
 cur_hostname=$(hostname)
 export cur_host=
@@ -144,25 +137,25 @@ function retry {
     local wait=1
     until "$@"; do
         exit="$?"
-        count=$(($count + 1))
         if [ $count -lt $retries ]; then
-            echo "Retry $count/$retries exited $exit, retrying in $wait seconds..."
+            log "INFO" "Attempt $count/$retries. Command exited with exit_code: $exit. Retrying after $wait seconds..."
             sleep $wait
         else
-            echo "Retry $count/$retries exited $exit, no more retries left."
+            log "INFO" "Command failed in all $retries attempts with exit_code: $exit. Stopping trying any further...."
             return $exit
         fi
+        count=$(($count + 1))
     done
     return 0
 }
 
+# wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
-    # wait for mysql daemon be running (alive)
     local mysql="$mysql_header --host=127.0.0.1"
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
-        log "INFO" "Trying to ping for host: '$cur_host', Got=====>'$out', Step=====>'$i'"
+        log "INFO" "Attempt $i: Pinging '$cur_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
         fi
@@ -173,10 +166,10 @@ function wait_for_mysqld_running() {
 
     if [[ "$i" == "0" ]]; then
         echo ""
-        log "ERROR" "Server ${cur_host} start failed..."
+        log "ERROR" "Server ${cur_host} failed to start in 900 seconds............."
         exit 1
     fi
-    log "INFO" "mysql daemon is ready to use for host: (${cur_host}) ..."
+    log "INFO" "mysql daemon is ready to use......."
 }
 
 function create_replication_user() {
@@ -185,15 +178,15 @@ function create_replication_user() {
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
     # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
     # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
-    log "INFO" "Checking whether replication user exist or not for host: ${cur_host}..."
+    log "INFO" "Checking whether replication user exist or not......"
     local mysql="$mysql_header --host=127.0.0.1"
 
-    # 1st try to find the the group `repl` user without error, then extract the out whether replication user exist or not
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
-        log "INFO" "Replication user not found and creating one..."
+        log "INFO" "Replication user not found. Creating new replication user........"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
@@ -207,20 +200,19 @@ function create_replication_user() {
 
         retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
     else
-        log "INFO" "Replication user info exists"
+        log "INFO" "Replication user exists. Skipping creating new one......."
     fi
 }
 
 function install_group_replication_plugin() {
-    # ensure the group replication plugin be installed
-    log "INFO" "Checking whether group replication plugin is installed or not..."
+    log "INFO" "Checking whether replication plugin is installed or not....."
     local mysql="$mysql_header --host=127.0.0.1"
 
-    # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
-        log "INFO" "Group replication plugin is not installed. Installing the plugin..."
+        log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
@@ -232,11 +224,10 @@ function install_group_replication_plugin() {
 }
 
 function install_clone_plugin() {
-    # ensure the group replication plugin be installed
-    log "INFO" "Checking whether clone plugin is installed or not..."
+    log "INFO" "Checking whether clone plugin is installed or not...."
     local mysql="$mysql_header --host=127.0.0.1"
 
-    # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep clone
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep clone)
     if [[ -z "$out" ]]; then
@@ -259,7 +250,7 @@ function check_existing_cluster() {
 
         members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
         cluster_size=${#members_id[@]}
-        log "INFO" "The size of existing cluster is $cluster_size"
+        log "INFO" "Number of online members: $cluster_size"
         if [[ "$cluster_size" -ge "1" ]]; then
             cluster_exists=1
             break
@@ -278,8 +269,7 @@ function check_member_list_updated() {
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
             cluster_size=${#listed_members_id[@]}
-
-            log "INFO" "Checking mysql cluster is updated for host: $host, online===> $alive_cluster_size total listed member===> $cluster_size, step===> $i"
+            log "INFO" "Attempt $i: Checking member list has been updated inside host: $host. Expected online member: $cluster_size. Found: $alive_cluster_size"
             if [[ "$alive_cluster_size" -eq "$cluster_size" ]]; then
                 break
             fi
@@ -289,7 +279,7 @@ function check_member_list_updated() {
 }
 
 function wait_for_primary() {
-    log "INFO" "Waiting for mysql group primary..."
+    log "INFO" "Waiting for group primary......"
     for host in $@; do
         if [[ "$cur_host" == "$host" ]]; then
             continue
@@ -298,22 +288,19 @@ function wait_for_primary() {
 
         members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
         cluster_size=${#members_id[@]}
-        log "INFO" "The size of existing alive cluster is $cluster_size"
 
         local is_primary_found=0
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Trying to find primary member id, step=====>$i"
+                log "INFO" "Attempt $: Trying to find primary member........................"
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
-                    # find database version and size from primary member for applying further clone approach
-                    primary_version=$(${mysql_header} --host=$primary_host -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
                     # calculate data size of the primary node.
                     # https://forums.mysql.com/read.php?108,201578,201578
                     primary_db_size=$(${mysql_header} --host=$primary_host -N -e 'select round(sum( data_length + index_length) / 1024 /  1024) "size in mb" from information_schema.tables;')
-                    log "INFO" "In existing group replication, found primary: $primary_host"
+                    log "INFO" "Primary found. Primary host: $primary_host, database size: $primary_db_size"
                     break
                 fi
 
@@ -331,6 +318,34 @@ function wait_for_primary() {
             break
         fi
     done
+}
+
+function set_valid_donors() {
+    log "INFO" "Checking whether valid donor is found or not. If found, set this to 'clone_valid_donor_list'"
+    local mysql="$mysql_header --host=127.0.0.1"
+    # clone process run when the donor and recipient must have the same MySQL server version and
+    # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
+    cur_host_version=$(${mysql} -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
+
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
+    retry 120 ${mysql_header} --host=$primary_host -N -e "SELECT * FROM performance_schema.replication_group_members;"
+
+    donor_list=$(${mysql_header} --host=$primary_host -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
+    valid_donor_found=0
+    for donor in ${donor_list[*]}; do
+        donor_version=$(${mysql_header} --host=$primary_host -N -e "SELECT MEMBER_VERSION FROM performance_schema.replication_group_members WHERE MEMBER_HOST = '${donor}';" | awk '{print $1}')
+        if [[ "$cur_host_version" == "$donor_version" ]]; then
+            donors=("${donors[@]}" "$donor")
+            valid_donor_found=1
+        fi
+    done
+
+    if [[ $valid_donor_found == 1 ]]; then
+        valid_donors=$(echo -n ${donors} | sed -e "s/ /:3306,/g" && echo -n ":3306")
+        log "INFO" "Valid donors found. The list of valid donor are: ${valid_donors}"
+        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-options-variables.html#sysvar_clone_valid_donor_list
+        retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${valid_donors}';"
+    fi
 }
 
 function bootstrap_cluster() {
@@ -357,24 +372,40 @@ function join_into_cluster() {
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
     # then run clone process to copy data directly from primary node. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-    is_clone_process_run=0
+    clone_used=0
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
-        retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='$primary_host:3306';"
-        # clone process run when the donor and recipient must have the same MySQL server version and
-        # the database size will be 128mb
-        # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=The%20clone%20plugin%20is%20supported,17%20and%20higher.&text=The%20donor%20and%20recipient%20MySQL%20server%20instances%20must%20run,same%20operating%20system%20and%20platform.
-        cur_host_version=$(${mysql_header} -N -e "SHOW VARIABLES LIKE 'version';" | awk '{print $2}')
-        if [[ "$primary_version" == "$cur_host_version" ]] && [ $primary_db_size -ge 128 ]; then
-            ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$primary_host':3306 IDENTIFIED BY 'password' REQUIRE SSL;"
-            is_clone_process_run=1
+        # the database size will be gather or equal than 128MB
+        if [[ $valid_donor_found == 1 ]] && [ $primary_db_size -ge 5 ]; then
+            for donor in ${donors[*]}; do
+                log "INFO" "Cloning data from $donor to $cur_host....."
+                ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;"
+
+                for i in {30..0}; do
+                    clone_status=$(${mysql} -N -e "SELECT STATE FROM performance_schema.clone_status;")
+                    if [[ "$clone_status" == "Completed" ]]; then
+                        clone_used=1
+                        break
+                    fi
+
+                    echo -n .
+                    sleep 1
+                done
+
+                if [[ $clone_used == 1 ]]; then
+                    break
+                fi
+
+                echo -n .
+                sleep 1
+            done
         fi
     fi
-    if [[ $is_clone_process_run == 0 ]]; then
-        # when clone approach not run then the member will try to join into the group
+    # If clone process didn't run or this host has restarted after the clone completed, it should join to the cluster directly.
+    if [[ $clone_used == 0 ]]; then
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
-        log "INFO" "Group replication on (${cur_host}) has been taken place..."
+        log "INFO" "Host (${cur_host}) has joined to the group......."
     fi
 }
 
@@ -384,30 +415,27 @@ export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
 export joining_for_first_time=0
-log "INFO" "Existing member in the group are: $member_hosts"
+log "INFO" "Host lists: $member_hosts"
 
-# wait for mysqld is getting ready for listen and serve
+# wait for mysqld to be ready
 wait_for_mysqld_running
 
-# ensure replication user for the group
+# ensure replication user
 create_replication_user
 
-# ensure replication plugin is installed
+# ensure replication plugin
 install_group_replication_plugin
 
-# ensure clone plugin is installed
+# ensure clone plugin
 install_clone_plugin
 
-# checking group replication existence
+# check for existing cluster
 check_existing_cluster "${member_hosts[*]}"
-
-# for cluster bootstrapping, by-default replica 0 will be selected for primary_host
-# it will also be overwritten in `wait_for_primary` function when it will get the updated primary_host
-export primary_host=$(get_host_name 0)
 
 if [[ "$cluster_exists" == "1" ]]; then
     check_member_list_updated "${member_hosts[*]}"
     wait_for_primary "${member_hosts[*]}"
+    set_valid_donors
     join_into_cluster
 else
     bootstrap_cluster
