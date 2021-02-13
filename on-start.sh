@@ -293,7 +293,7 @@ function wait_for_primary() {
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Attempt $: Trying to find primary member........................"
+                log "INFO" "Attempt $i: Trying to find primary member........................"
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
@@ -341,7 +341,7 @@ function set_valid_donors() {
     done
 
     if [[ $valid_donor_found == 1 ]]; then
-        valid_donors=$(echo -n ${donors} | sed -e "s/ /:3306,/g" && echo -n ":3306")
+        valid_donors=$(echo -n ${donors[*]} | sed -e "s/ /:3306,/g" && echo -n ":3306")
         log "INFO" "Valid donors found. The list of valid donor are: ${valid_donors}"
         # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-options-variables.html#sysvar_clone_valid_donor_list
         retry 120 ${mysql} -N -e "SET GLOBAL clone_valid_donor_list='${valid_donors}';"
@@ -370,40 +370,50 @@ function join_into_cluster() {
     local mysql="$mysql_header --host=127.0.0.1"
 
     # for 1st time joining, there need to run `RESET MASTER` to set the binlog and gtid's initial position.
-    # then run clone process to copy data directly from primary node. That's why pod will be restart for 1st time joining into the group replication.
+    # then run clone process to copy data directly from valid donor. That's why pod will be restart for 1st time joining into the group replication.
     # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html
-    clone_used=0
+    mysqld_alive=1
     if [[ "$joining_for_first_time" == "1" ]]; then
         log "INFO" "Resetting binlog & gtid to initial state as $cur_host is joining for first time.."
         retry 120 ${mysql} -N -e "RESET MASTER;"
-        # the database size will be gather or equal than 128MB
-        if [[ $valid_donor_found == 1 ]] && [ $primary_db_size -ge 5 ]; then
+        # clone process will run when the joiner get valid donor and the primary member's data will be be gather or equal than 128MB
+        if [[ $valid_donor_found == 1 ]] && [ $primary_db_size -ge 128 ]; then
             for donor in ${donors[*]}; do
                 log "INFO" "Cloning data from $donor to $cur_host....."
-                ${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;"
+                error_message=$(${mysql} -N -e "CLONE INSTANCE FROM 'repl'@'$donor':3306 IDENTIFIED BY 'password' REQUIRE SSL;" 2>&1)
+                # we may get an error when the cloning process has finished like:
+                # ".ERROR 3707 (HY000) at line 1: Restart server failed (mysqld is not managed by supervisor process)"
+                # This error does not indicate a cloning failure.
+                # It means that the recipient MySQL server instance must be started again manually after the data is cloned
+                # https://dev.mysql.com/doc/refman/8.0/en/clone-plugin-remote.html#:~:text=ERROR%203707%20(HY000)%3A%20Restart,not%20managed%20by%20supervisor%20process).&text=It%20means%20that%20the%20recipient,after%20the%20data%20is%20cloned.
+                log "INFO" "Clone error message: $error_message"
+                if [[ "$error_message" != *"mysqld is not managed by supervisor process"* ]]; then
+                    # retry cloning process for next valid donor
+                    continue
+                fi
 
-                for i in {30..0}; do
-                    clone_status=$(${mysql} -N -e "SELECT STATE FROM performance_schema.clone_status;")
-                    if [[ "$clone_status" == "Completed" ]]; then
-                        clone_used=1
+                # wait for background process `mysqld` have been killed
+                for i in {120..0}; do
+                    kill -0 $pid
+                    exit="$?"
+                    log "INFO" "Attempt $i: Checking mysqld(process id=$pid) is alive or not, exit code: $exit"
+                    if [[ "$exit" != "0" ]]; then
+                        mysqld_alive=0
                         break
                     fi
-
                     echo -n .
                     sleep 1
                 done
 
-                if [[ $clone_used == 1 ]]; then
-                    break
+                if [[ "$mysqld_alive" == "0" ]]; then
+                  break
                 fi
 
-                echo -n .
-                sleep 1
             done
         fi
     fi
-    # If clone process didn't run or this host has restarted after the clone completed, it should join to the cluster directly.
-    if [[ $clone_used == 0 ]]; then
+    # If the host is still alive, it will join the cluster directly.
+    if [[ $mysqld_alive == 1 ]]; then
         retry 120 ${mysql} -N -e "START GROUP_REPLICATION USER='repl', PASSWORD='password';"
         log "INFO" "Host (${cur_host}) has joined to the group......."
     fi
