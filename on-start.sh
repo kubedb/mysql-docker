@@ -28,13 +28,6 @@ function log() {
     echo "$(timestamp) [$script_name] [$type] $msg"
 }
 
-# get_host_name() expects only one argument and that is the index of the Pod of StatefulSet.
-# And it forms the FQDN (Fully Qualified Domain Name) of the $1'th Pod of StatefulSet.
-function get_host_name() {
-    #  echo -n "$BASE_NAME-$1.$GOV_SVC.$NAMESPACE.svc.cluster.local"
-    echo -n "$BASE_NAME-$1.$GOV_SVC.$NAMESPACE"
-}
-
 # get the host names from stdin sent by peer-finder program
 cur_hostname=$(hostname)
 export cur_host=
@@ -64,7 +57,7 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # “Unique” means that each ID must be different from every other ID in use by any other source or replica in the replication topology
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
 # the server ID is calculated using the below formula:
-# svr_id=statefulset_ordinal * 100 + pod_ordinal
+# server_id=statefulset_ordinal * 100 + pod_ordinal + 1
 declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
 declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
 declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
@@ -143,25 +136,25 @@ function retry {
     local wait=1
     until "$@"; do
         exit="$?"
-        count=$(($count + 1))
         if [ $count -lt $retries ]; then
-            echo "Retry $count/$retries exited $exit, retrying in $wait seconds..."
+            log "INFO" "Attempt $count/$retries. Command exited with exit_code: $exit. Retrying after $wait seconds..."
             sleep $wait
         else
-            echo "Retry $count/$retries exited $exit, no more retries left."
+            log "INFO" "Command failed in all $retries attempts with exit_code: $exit. Stopping trying any further...."
             return $exit
         fi
+        count=$(($count + 1))
     done
     return 0
 }
 
+# wait for mysql daemon be running (alive)
 function wait_for_mysqld_running() {
-    # wait for mysql daemon be running (alive)
     local mysql="$mysql_header --host=127.0.0.1"
 
     for i in {900..0}; do
         out=$(mysql -N -e "select 1;" 2>/dev/null)
-        log "INFO" "Trying to ping for host: '$cur_host', Got=====>'$out', Step=====>'$i'"
+        log "INFO" "Attempt $i: Pinging '$cur_host' has returned: '$out'...................................."
         if [[ "$out" == "1" ]]; then
             break
         fi
@@ -172,10 +165,10 @@ function wait_for_mysqld_running() {
 
     if [[ "$i" == "0" ]]; then
         echo ""
-        log "ERROR" "Server ${cur_host} start failed..."
+        log "ERROR" "Server ${cur_host} failed to start in 900 seconds............."
         exit 1
     fi
-    log "INFO" "mysql daemon is ready to use for host: (${cur_host}) ..."
+    log "INFO" "mysql daemon is ready to use......."
 }
 
 function create_replication_user() {
@@ -184,15 +177,15 @@ function create_replication_user() {
     # 01. official doc (section from 17.2.1.3 to 17.2.1.5): https://dev.mysql.com/doc/refman/5.7/en/group-replication-user-credentials.html
     # 02. https://dev.mysql.com/doc/refman/8.0/en/group-replication-secure-user.html
     # 03. digitalocean doc: https://www.digitalocean.com/community/tutorials/how-to-configure-mysql-group-replication-on-ubuntu-16-04
-    log "INFO" "Checking whether replication user exist or not for host: ${cur_host}..."
+    log "INFO" "Checking whether replication user exist or not......"
     local mysql="$mysql_header --host=127.0.0.1"
 
-    # 1st try to find the the group `repl` user without error, then extract the out whether replication user exist or not
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}'
     out=$(${mysql} -N -e "select count(host) from mysql.user where mysql.user.user='repl';" | awk '{print$1}')
     # if the user doesn't exist, crete new one.
     if [[ "$out" -eq "0" ]]; then
-        log "INFO" "Replication user not found and creating one..."
+        log "INFO" "Replication user not found. Creating new replication user........"
         retry 120 ${mysql} -N -e "SET SQL_LOG_BIN=0;"
         retry 120 ${mysql} -N -e "CREATE USER 'repl'@'%' IDENTIFIED BY 'password' REQUIRE SSL;"
         retry 120 ${mysql} -N -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
@@ -201,20 +194,19 @@ function create_replication_user() {
 
         retry 120 ${mysql} -N -e "CHANGE MASTER TO MASTER_USER='repl', MASTER_PASSWORD='password' FOR CHANNEL 'group_replication_recovery';"
     else
-        log "INFO" "Replication user info exists"
+        log "INFO" "Replication user exists. Skipping creating new one......."
     fi
 }
 
 function install_group_replication_plugin() {
-    # ensure the group replication plugin be installed
-    log "INFO" "Checking whether group replication plugin is installed or not..."
+    log "INFO" "Checking whether replication plugin is installed or not....."
     local mysql="$mysql_header --host=127.0.0.1"
 
-    # 1st try to find the the group replication plugin installed without error, then extract the out whether plugin exists or not
+    # At first, ensure that the command executes without any error. Then, run the command again and extract the output.
     retry 120 ${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication
     out=$(${mysql} -N -e 'SHOW PLUGINS;' | grep group_replication)
     if [[ -z "$out" ]]; then
-        log "INFO" "Group replication plugin is not installed. Installing the plugin..."
+        log "INFO" "Group replication plugin is not installed. Installing the plugin...."
         # replication plugin will be installed when the member getting bootstrapped or joined into the group first time.
         # that's why assign `joining_for_first_time` variable to 1 for making further reset process.
         joining_for_first_time=1
@@ -236,7 +228,7 @@ function check_existing_cluster() {
 
         members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';"))
         cluster_size=${#members_id[@]}
-        log "INFO" "The size of existing cluster is $cluster_size"
+        log "INFO" "Number of online members: $cluster_size"
         if [[ "$cluster_size" -ge "1" ]]; then
             cluster_exists=1
             break
@@ -255,8 +247,7 @@ function check_member_list_updated() {
             alive_cluster_size=${#alive_members_id[@]}
             listed_members_id=($(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members;"))
             cluster_size=${#listed_members_id[@]}
-
-            log "INFO" "Checking mysql cluster is updated for host: $host, online===> $alive_cluster_size total listed member===> $cluster_size, step===> $i"
+            log "INFO" "Attempt $i: Checking member list has been updated inside host: $host. Expected online member: $cluster_size. Found: $alive_cluster_size"
             if [[ "$alive_cluster_size" -eq "$cluster_size" ]]; then
                 break
             fi
@@ -266,7 +257,7 @@ function check_member_list_updated() {
 }
 
 function wait_for_primary() {
-    log "INFO" "Waiting for mysql group primary..."
+    log "INFO" "Waiting for group primary......"
     for host in $@; do
         if [[ "$cur_host" == "$host" ]]; then
             continue
@@ -275,13 +266,12 @@ function wait_for_primary() {
 
         members_id=$(${mysql} -N -e "SELECT MEMBER_ID FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE';")
         cluster_size=${#members_id[@]}
-        log "INFO" "The size of existing alive cluster is $cluster_size"
 
         local is_primary_found=0
         for member_id in ${members_id[*]}; do
             for i in {60..0}; do
                 primary_member_id=$(${mysql} -N -e "SHOW STATUS WHERE Variable_name = 'group_replication_primary_member';" | awk '{print $2}')
-                log "INFO" "Trying to find primary member id, step=====>$i"
+                log "INFO" "Attempt $i: Trying to find primary member........................"
                 if [[ -n "$primary_member_id" ]]; then
                     is_primary_found=1
                     primary_host=$(${mysql} -N -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID = '${primary_member_id}';" | awk '{print $1}')
@@ -343,27 +333,24 @@ export mysql_header="mysql -u ${USER} --port=3306"
 export MYSQL_PWD=${PASSWORD}
 export member_hosts=$(echo -n ${hosts} | sed -e "s/,/ /g")
 export joining_for_first_time=0
-log "INFO" "Existing member in the group are: $member_hosts"
+log "INFO" "Host lists: $member_hosts"
 
-# wait for mysqld is getting ready for listen and serve
+# wait for mysqld to be ready
 wait_for_mysqld_running
 
-# ensure replication user for the group
+# ensure replication user
 create_replication_user
 
-# ensure replication plugin is installed
+# ensure replication plugin
 install_group_replication_plugin
 
 # checking group replication existence
 check_existing_cluster "${member_hosts[*]}"
 
-# for cluster bootstrapping, by-default replica 0 will be selected for primary_host
-# it will also be overwritten in `wait_for_primary` function when it will get the updated primary_host
-export primary_host=$(get_host_name 0)
-
 if [[ "$cluster_exists" == "1" ]]; then
     check_member_list_updated "${member_hosts[*]}"
     wait_for_primary "${member_hosts[*]}"
+    set_valid_donors
     join_into_cluster
 else
     bootstrap_cluster
