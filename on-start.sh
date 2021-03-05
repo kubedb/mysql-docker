@@ -58,7 +58,11 @@ export seeds=$(echo -n ${hosts} | sed -e "s/,/:33061,/g" && echo -n ":33061")
 # https://dev.mysql.com/doc/refman/8.0/en/replication-options.html#sysvar_server_id
 # the server ID is calculated using the below formula:
 # server_id=statefulset_ordinal * 100 + pod_ordinal + 1
-declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
+if [[ "${BASE_NAME}" == "${DB_NAME}" ]]; then
+    declare -i ss_ordinal=0
+else
+    declare -i ss_ordinal=$(echo -n ${BASE_NAME} | sed -e "s/${DB_NAME}-//g")
+fi
 declare -i pod_ordinal=$(hostname | sed -e "s/${BASE_NAME}-//g")
 declare -i svr_id=$ss_ordinal*100+$pod_ordinal+1
 
@@ -306,7 +310,9 @@ function bootstrap_cluster() {
     #   ref:  https://dev.mysql.com/doc/refman/8.0/en/group-replication-bootstrap.html
     local mysql="$mysql_header --host=127.0.0.1"
     log "INFO" "bootstrapping cluster with host $cur_host..."
-    retry 120 ${mysql} -N -e "RESET MASTER;"
+    if [[ "$joining_for_first_time" == "1" ]]; then
+        retry 120 ${mysql} -N -e "RESET MASTER;"
+    fi
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=ON;"
     retry 120 ${mysql} -N -e "START GROUP_REPLICATION;"
     retry 120 ${mysql} -N -e "SET GLOBAL group_replication_bootstrap_group=OFF;"
