@@ -357,7 +357,6 @@ check_existing_cluster "${member_hosts[*]}"
 if [[ "$cluster_exists" == "1" ]]; then
     check_member_list_updated "${member_hosts[*]}"
     wait_for_primary "${member_hosts[*]}"
-    set_valid_donors
     join_into_cluster
 else
     bootstrap_cluster
